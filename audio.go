@@ -5,6 +5,7 @@ package reisen
 // #include <libavformat/avformat.h>
 // #include <libavutil/avutil.h>
 // #include <libswresample/swresample.h>
+// #include <libavutil/channel_layout.h>
 import "C"
 import (
 	"fmt"
@@ -30,7 +31,7 @@ type AudioStream struct {
 // ChannelCount returns the number of channels
 // (1 for mono, 2 for stereo, etc.).
 func (audio *AudioStream) ChannelCount() int {
-	return int(audio.codecParams.channels)
+	return int(audio.codecParams.ch_layout.nb_channels)
 }
 
 // SampleRate returns the sample rate of the
@@ -54,12 +55,21 @@ func (audio *AudioStream) Open() error {
 		return err
 	}
 
-	audio.swrCtx = C.swr_alloc_set_opts(nil,
-		C.AV_CH_FRONT_LEFT|C.AV_CH_FRONT_RIGHT,
+	// FFmpeg 7: use AVChannelLayout + swr_alloc_set_opts2
+	var outLayout C.AVChannelLayout
+	// Make a default stereo layout (2 channels)
+	C.av_channel_layout_default(&outLayout, C.int(StandardChannelCount))
+	defer C.av_channel_layout_uninit(&outLayout)
+
+	if C.swr_alloc_set_opts2(
+		&audio.swrCtx,
+		&outLayout,
 		C.AV_SAMPLE_FMT_DBL, audio.codecCtx.sample_rate,
-		channelLayout(audio), audio.
-			codecCtx.sample_fmt, audio.codecCtx.
-			sample_rate, 0, nil)
+		&audio.codecCtx.ch_layout, audio.codecCtx.sample_fmt, audio.codecCtx.sample_rate,
+		0, nil,
+	) < 0 {
+		audio.swrCtx = nil
+	}
 
 	if audio.swrCtx == nil {
 		return fmt.Errorf(
@@ -139,8 +149,7 @@ func (audio *AudioStream) ReadAudioFrame() (*AudioFrame, bool, error) {
 		audio.buffer), maxBufferSize)
 	frame := newAudioFrame(audio,
 		int64(audio.frame.pts),
-		int(audio.frame.coded_picture_number),
-		int(audio.frame.display_picture_number), data)
+		0, 0, data)
 
 	return frame, true, nil
 }

@@ -118,11 +118,19 @@ func (video *VideoStream) OpenDecode(width, height int, alg InterpolationAlgorit
 // ApplyVideoFilterGraph builds and enables a libavfilter graph that will run
 // on decoded frames (e.g. "scale=640:480:flags=bilinear,format=rgba").
 //
-// Call this AFTER Open()/OpenDecode(). Any existing video filtergraph is replaced.
+// Call this AFTER Open()/OpenDecode(). We replace any existing graph, but
+// actual construction is deferred until the first decoded frame so that the
+// buffer source matches the frame's colorspace/range/SAR/etc.
 func (video *VideoStream) ApplyVideoFilterGraph(graph string) error {
-	// Tear down any previous graph
 	video.RemoveVideoFilterGraph()
+	video.filterGraphDesc = graph
+	return nil
+}
 
+// buildFilterGraphFromFrame creates the libavfilter graph and buffer source so that
+// its properties MATCH the very first decoded frame. This prevents “Changing video
+// frame properties…” warnings on FFmpeg 7.x.
+func (video *VideoStream) buildFilterGraphFromFrame(f *C.AVFrame) error {
 	// Allocate graph
 	video.filterGraph = C.avfilter_graph_alloc()
 	if video.filterGraph == nil {
@@ -130,54 +138,55 @@ func (video *VideoStream) ApplyVideoFilterGraph(graph string) error {
 	}
 
 	// Prepare buffer source (input) and buffer sink (output)
-	bufSrc := C.avfilter_get_by_name(C.CString("buffer"))
-	bufSink := C.avfilter_get_by_name(C.CString("buffersink"))
+	nameBuf := C.CString("buffer"); defer C.free(unsafe.Pointer(nameBuf))
+	bufSrc := C.avfilter_get_by_name(nameBuf)
+	nameBufSink := C.CString("buffersink"); defer C.free(unsafe.Pointer(nameBufSink))
+	bufSink := C.avfilter_get_by_name(nameBufSink)
 	if bufSrc == nil || bufSink == nil {
 		video.RemoveVideoFilterGraph()
 		return fmt.Errorf("missing buffer/buffersink filters in libavfilter")
 	}
 
-	// Build args for "buffer"
+	// Build args for "buffer" from the frame
 	tbNum := video.inner.time_base.num
 	tbDen := video.inner.time_base.den
-	sarNum := video.codecCtx.sample_aspect_ratio.num
-	sarDen := video.codecCtx.sample_aspect_ratio.den
+	sarNum := f.sample_aspect_ratio.num
+	sarDen := f.sample_aspect_ratio.den
 	if sarNum == 0 || sarDen == 0 {
-		// default to 1:1 if not set
 		sarNum, sarDen = 1, 1
 	}
-
 	args := fmt.Sprintf(
 		"video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
-		int(video.codecCtx.width), int(video.codecCtx.height),
-		int(video.codecCtx.pix_fmt),
+		int(f.width), int(f.height),
+		int(f.format),
 		int(tbNum), int(tbDen),
 		int(sarNum), int(sarDen),
 	)
+	// If present, add colorspace/range so buffer matches the frame exactly.
+	if int(f.colorspace) != 0 {
+		args += fmt.Sprintf(":colorspace=%d", int(f.colorspace))
+	}
+	if int(f.color_range) != 0 {
+		args += fmt.Sprintf(":range=%d", int(f.color_range))
+	}
 
-	csArgs := C.CString(args)
-	defer C.free(unsafe.Pointer(csArgs))
-	nameIn := C.CString("in")
-	defer C.free(unsafe.Pointer(nameIn))
-	nameOut := C.CString("out")
-	defer C.free(unsafe.Pointer(nameOut))
+	csArgs := C.CString(args); defer C.free(unsafe.Pointer(csArgs))
+	nameIn := C.CString("in");  defer C.free(unsafe.Pointer(nameIn))
+	nameOut := C.CString("out"); defer C.free(unsafe.Pointer(nameOut))
 
 	var ret C.int
-	ret = C.avfilter_graph_create_filter(
-		&video.bufSrcCtx, bufSrc, nameIn, csArgs, nil, video.filterGraph)
+	ret = C.avfilter_graph_create_filter(&video.bufSrcCtx, bufSrc, nameIn, csArgs, nil, video.filterGraph)
 	if ret < 0 {
 		video.RemoveVideoFilterGraph()
 		return fmt.Errorf("%d: couldn't create buffer source", int(ret))
 	}
-
-	ret = C.avfilter_graph_create_filter(
-		&video.bufSinkCtx, bufSink, nameOut, nil, nil, video.filterGraph)
+	ret = C.avfilter_graph_create_filter(&video.bufSinkCtx, bufSink, nameOut, nil, nil, video.filterGraph)
 	if ret < 0 {
 		video.RemoveVideoFilterGraph()
 		return fmt.Errorf("%d: couldn't create buffer sink", int(ret))
 	}
 
-	// Wrap our endpoints for graph parsing: [in] -> graph -> [out]
+	// Wrap our endpoints for graph parsing: [in] -> user graph -> [out]
 	inouts := C.avfilter_inout_alloc()
 	outputs := C.avfilter_inout_alloc()
 	if inouts == nil || outputs == nil {
@@ -205,7 +214,7 @@ func (video *VideoStream) ApplyVideoFilterGraph(graph string) error {
 	inouts.pad_idx = 0
 	inouts.next = nil
 
-	csGraph := C.CString(graph)
+	csGraph := C.CString(video.filterGraphDesc)
 	defer C.free(unsafe.Pointer(csGraph))
 	ret = C.avfilter_graph_parse_ptr(video.filterGraph, csGraph, &inouts, &outputs, nil)
 	if ret < 0 {
@@ -226,7 +235,6 @@ func (video *VideoStream) ApplyVideoFilterGraph(graph string) error {
 		return fmt.Errorf("couldn't allocate filtered frame")
 	}
 
-	video.filterGraphDesc = graph
 	return nil
 }
 
@@ -269,6 +277,15 @@ func (video *VideoStream) ReadVideoFrame() (*VideoFrame, bool, error) {
 		return nil, false, nil
 	}
 
+	// Lazily build the filtergraph using the *first* decoded frame’s properties.
+	if video.filterGraph == nil && video.filterGraphDesc != "" {
+		if err := video.buildFilterGraphFromFrame(video.frame); err != nil {
+			// Silent fallback to sws_scale; clear desc so we don't retry each frame.
+			video.RemoveVideoFilterGraph()
+			// (No error returned — caller continues with sws_scale path.)
+		}
+	}
+
 	// If a libavfilter graph is active, run frame through it and return filtered RGBA.
 	if video.filterGraph != nil && video.bufSrcCtx != nil && video.bufSinkCtx != nil && video.filteredFrame != nil {
 		// Push decoded frame into the graph
@@ -298,8 +315,7 @@ func (video *VideoStream) ReadVideoFrame() (*VideoFrame, bool, error) {
 		C.av_frame_unref(video.filteredFrame)
 
 		frame := newVideoFrame(video, int64(video.frame.pts),
-			int(video.frame.coded_picture_number),
-			int(video.frame.display_picture_number),
+			0, 0,
 			w, h, buf)
 		return frame, true, nil
 	}
@@ -313,8 +329,7 @@ func (video *VideoStream) ReadVideoFrame() (*VideoFrame, bool, error) {
 
 	data := C.GoBytes(unsafe.Pointer(video.rgbaFrame.data[0]), video.bufSize)
 	frame := newVideoFrame(video, int64(video.frame.pts),
-		int(video.frame.coded_picture_number),
-		int(video.frame.display_picture_number),
+		0, 0,
 		int(video.codecCtx.width), int(video.codecCtx.height), data)
 
 	return frame, true, nil
