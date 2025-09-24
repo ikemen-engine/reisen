@@ -11,7 +11,7 @@ import (
 	"github.com/faiface/beep/speaker"
 	"github.com/hajimehoshi/ebiten"
 	_ "github.com/silbinarywolf/preferdiscretegpu"
-	"github.com/zergon321/reisen"
+	"github.com/ikemen-engine/reisen"
 )
 
 const (
