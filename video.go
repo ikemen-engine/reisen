@@ -6,6 +6,7 @@ package reisen
 // #include <libavutil/avutil.h>
 // #include <libavutil/imgutils.h>
 // #include <libavutil/opt.h>
+// #include <libavutil/pixdesc.h>
 // #include <libswscale/swscale.h>
 // #include <libavfilter/avfilter.h>
 // #include <libavfilter/buffersrc.h>
@@ -31,6 +32,13 @@ type VideoStream struct {
 	bufSinkCtx      *C.AVFilterContext
 	filteredFrame   *C.AVFrame
 	filterGraphDesc string
+	// sws (fallback) lazy-init tracking
+	targetW         C.int
+	targetH         C.int
+	swsAlg          InterpolationAlgorithm
+	lastSrcW        C.int
+	lastSrcH        C.int
+	lastSrcFmt      C.int
 }
 
 // AspectRatio returns the fraction of the video
@@ -77,6 +85,10 @@ func (video *VideoStream) OpenDecode(width, height int, alg InterpolationAlgorit
 			"couldn't allocate a new RGBA frame")
 	}
 
+	// Remember desired output for swscale fallback; swsCtx is created lazily on first frame.
+	video.targetW = C.int(width)
+	video.targetH = C.int(height)
+
 	video.bufSize = C.av_image_get_buffer_size(
 		C.AV_PIX_FMT_RGBA, C.int(width), C.int(height), 1)
 
@@ -102,15 +114,9 @@ func (video *VideoStream) OpenDecode(width, height int, alg InterpolationAlgorit
 			"%d: couldn't fill the image arrays", status)
 	}
 
-	video.swsCtx = C.sws_getContext(video.codecCtx.width,
-		video.codecCtx.height, video.codecCtx.pix_fmt,
-		C.int(width), C.int(height),
-		C.AV_PIX_FMT_RGBA, C.int(alg), nil, nil, nil)
-
-	if video.swsCtx == nil {
-		return fmt.Errorf(
-			"couldn't create an SWS context")
-	}
+	// Defer SWS context creation until we see the first frame (FFmpeg 8 requires valid src fmt).
+	video.swsCtx = nil
+	video.swsAlg = alg
 
 	return nil
 }
@@ -147,34 +153,26 @@ func (video *VideoStream) buildFilterGraphFromFrame(f *C.AVFrame) error {
 		return fmt.Errorf("missing buffer/buffersink filters in libavfilter")
 	}
 
-	// Build args for "buffer" from the frame
-	tbNum := video.inner.time_base.num
-	tbDen := video.inner.time_base.den
-	sarNum := f.sample_aspect_ratio.num
-	sarDen := f.sample_aspect_ratio.den
-	if sarNum == 0 || sarDen == 0 {
-		sarNum, sarDen = 1, 1
-	}
-	args := fmt.Sprintf(
-		"video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
-		int(f.width), int(f.height),
-		int(f.format),
-		int(tbNum), int(tbDen),
-		int(sarNum), int(sarDen),
-	)
-	// If present, add colorspace/range so buffer matches the frame exactly.
-	if int(f.colorspace) != 0 {
-		args += fmt.Sprintf(":colorspace=%d", int(f.colorspace))
-	}
-	if int(f.color_range) != 0 {
-		args += fmt.Sprintf(":range=%d", int(f.color_range))
-	}
-
-	csArgs := C.CString(args); defer C.free(unsafe.Pointer(csArgs))
 	nameIn := C.CString("in");  defer C.free(unsafe.Pointer(nameIn))
 	nameOut := C.CString("out"); defer C.free(unsafe.Pointer(nameOut))
 
 	var ret C.int
+	// Create buffer with a minimal arg string so pix_fmt is pinned
+	tbNum := video.inner.time_base.num
+	tbDen := video.inner.time_base.den
+	sar := f.sample_aspect_ratio
+	if sar.num == 0 || sar.den == 0 {
+		sar.num, sar.den = 1, 1
+	}
+	args := fmt.Sprintf(
+		"video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+		int(f.width), int(f.height), int(f.format),
+		int(tbNum), int(tbDen),
+		int(sar.num), int(sar.den),
+	)
+	csArgs := C.CString(args)
+	defer C.free(unsafe.Pointer(csArgs))
+
 	ret = C.avfilter_graph_create_filter(&video.bufSrcCtx, bufSrc, nameIn, csArgs, nil, video.filterGraph)
 	if ret < 0 {
 		video.RemoveVideoFilterGraph()
@@ -185,6 +183,39 @@ func (video *VideoStream) buildFilterGraphFromFrame(f *C.AVFrame) error {
 		video.RemoveVideoFilterGraph()
 		return fmt.Errorf("%d: couldn't create buffer sink", int(ret))
 	}
+
+	// Set source parameters from the *first frame* so buffer exactly matches incoming properties.
+	params := C.av_buffersrc_parameters_alloc()
+	if params == nil {
+		video.RemoveVideoFilterGraph()
+		return fmt.Errorf("couldn't alloc AVBufferSrcParameters")
+	}
+	// Fill params
+	params.time_base = video.inner.time_base
+	params.width = f.width
+	params.height = f.height
+	params.format = f.format
+	params.sample_aspect_ratio = f.sample_aspect_ratio
+	// Colorspace/range/chroma when specified; leave as default otherwise
+	if f.colorspace != C.AVCOL_SPC_UNSPECIFIED {
+		params.color_space = (C.enum_AVColorSpace)(f.colorspace)
+	}
+	if f.color_range != C.AVCOL_RANGE_UNSPECIFIED {
+		params.color_range = (C.enum_AVColorRange)(f.color_range)
+	}
+	// NOTE: Older FFmpeg (e.g., 7.1) AVBufferSrcParameters has no chroma_location field,
+	// and AVFrame exposes it as 'chroma_location' (not chroma_sample_location).
+	// We do not set it to stay source-compatible across 7.1 and 8.x.
+	// if f.chroma_location != C.AVCHROMA_LOC_UNSPECIFIED {
+	//	params.chroma_location = (C.enum_AVChromaLocation)(f.chroma_location)
+	// }
+	// Apply
+	if ret = C.av_buffersrc_parameters_set(video.bufSrcCtx, params); ret < 0 {
+		C.av_free(unsafe.Pointer(params))
+		video.RemoveVideoFilterGraph()
+		return fmt.Errorf("%d: couldn't set buffersrc parameters", int(ret))
+	}
+	C.av_free(unsafe.Pointer(params))
 
 	// Wrap our endpoints for graph parsing: [in] -> user graph -> [out]
 	inouts := C.avfilter_inout_alloc()
@@ -320,10 +351,44 @@ func (video *VideoStream) ReadVideoFrame() (*VideoFrame, bool, error) {
 		return frame, true, nil
 	}
 
-	// No filtergraph: fall back to sws_scale to RGBA at the decode size.
+	// No filtergraph: fall back to sws_scale to RGBA at the requested size.
+	// Lazily (re)create swsCtx from the *actual* source frame properties.
+	srcW := video.frame.width
+	srcH := video.frame.height
+	srcFmt := video.frame.format
+	if srcW <= 0 || srcH <= 0 {
+		// Guard against invalid frame dims; skip this frame.
+		return nil, true, nil
+	}
+	if srcFmt == C.int(C.AV_PIX_FMT_NONE) || srcFmt < 0 {
+		// Source format unknown — skip; decoder should set it on subsequent frames.
+		return nil, true, nil
+	}
+	if video.swsCtx == nil ||
+		video.lastSrcW != srcW || video.lastSrcH != srcH || video.lastSrcFmt != srcFmt {
+		// (Re)build SWS context using the real source fmt/size.
+		if video.swsCtx != nil {
+			C.sws_freeContext(video.swsCtx)
+			video.swsCtx = nil
+		}
+		video.swsCtx = C.sws_getContext(
+			srcW, srcH, (C.enum_AVPixelFormat)(srcFmt),
+			video.targetW, video.targetH,
+			C.AV_PIX_FMT_RGBA, C.int(video.swsAlg),
+			nil, nil, nil,
+		)
+		if video.swsCtx == nil {
+			// Cannot build SWS; skip frame (caller still progresses decode).
+			return nil, true, nil
+		}
+		video.lastSrcW = srcW
+		video.lastSrcH = srcH
+		video.lastSrcFmt = srcFmt
+	}
+
 	C.sws_scale(video.swsCtx, &video.frame.data[0],
 		&video.frame.linesize[0], 0,
-		video.codecCtx.height,
+		srcH,
 		&video.rgbaFrame.data[0],
 		&video.rgbaFrame.linesize[0])
 
@@ -346,10 +411,12 @@ func (video *VideoStream) Close() error {
 	// Free libavfilter graph (if any)
 	video.RemoveVideoFilterGraph()
 
+	if video.swsCtx != nil {
+		C.sws_freeContext(video.swsCtx)
+		video.swsCtx = nil
+	}
 	C.av_free(unsafe.Pointer(video.rgbaFrame))
 	video.rgbaFrame = nil
-	C.sws_freeContext(video.swsCtx)
-	video.swsCtx = nil
 
 	return nil
 }
