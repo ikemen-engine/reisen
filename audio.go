@@ -55,6 +55,9 @@ func (audio *AudioStream) Open() error {
 		return err
 	}
 
+	// Ensure the decoder knows the packet time base.
+	audio.codecCtx.pkt_timebase = audio.inner.time_base
+
 	// FFmpeg 7: use AVChannelLayout + swr_alloc_set_opts2
 	var outLayout C.AVChannelLayout
 	// Make a default stereo layout (2 channels)
@@ -145,11 +148,10 @@ func (audio *AudioStream) ReadAudioFrame() (*AudioFrame, bool, error) {
 			"%d: couldn't convert the audio frame", gotSamples)
 	}
 
-	data := C.GoBytes(unsafe.Pointer(
-		audio.buffer), maxBufferSize)
-	frame := newAudioFrame(audio,
-		int64(audio.frame.pts),
-		0, 0, data)
+	// Copy only the actually produced samples.
+	outSize := C.av_samples_get_buffer_size(nil, StandardChannelCount, gotSamples, C.AV_SAMPLE_FMT_DBL, 1)
+	data := C.GoBytes(unsafe.Pointer(audio.buffer), outSize)
+	frame := newAudioFrame(audio, int64(audio.frame.pts), 0, 0, data)
 
 	return frame, true, nil
 }
